@@ -1,0 +1,2032 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.2" snapToGrid="true">
+  <code><![CDATA[
+globals [pitch-min-x pitch-max-x pitch-min-y pitch-max-y pitch-length pitch-width
+goal-mouth goal-scored? goal-side blue-score orange-score
+start? match-timer ticks-since-last-touch  
+score-chaser score-sentinel score-bully score-pro-rotator]
+breed [ balls ball ]
+balls-own [vx vy]
+breed [small-boostpads small-boostpad]
+boostpads-own [ boost-amount cooldown ]
+small-boostpads-own [ boost-amount cooldown ] ;; boost-amount sera 12
+breed [boostpads boostpad]
+breed [boostcores boostcore]
+breed [cars car]
+cars-own [team archetype boostInCar speed max-speed accel turn-rate
+; --- chaser memory/state ---
+chaser-mode target-boost
+unblock-timer unblock-target-x unblock-target-y
+bully-target bully-timer]
+to setup
+clear-turtles clear-patches  clear-drawing   clear-output ; clear all besides the performance plot.
+  
+setup-constants draw-pitch draw-side-bands-diagonal draw-center-markings draw-goals-and-nets place-big-boostpads place-small-boostpads
+set ticks-since-last-touch 0 set match-timer 150 set blue-score 0 set orange-score 0
+ask balls [ die ]
+create-ball place-cars-2v2 label-cars assign-2v2-archetypes blue-arch-1 blue-arch-2 orange-arch-1 orange-arch-2
+set start? true 
+
+reset-ticks
+end
+; --- WORLD / SCALE ---
+to setup-world-100x80
+resize-world -50 49 -40 39 set-patch-size 10 display
+end
+to setup-constants
+set pitch-length 100 set pitch-width 80 set pitch-min-x min-pxcor set pitch-max-x max-pxcor set pitch-min-y min-pycor set pitch-max-y max-pycor set goal-mouth 15
+end
+; --- DRAW PITCH ---
+to draw-pitch
+ask patches [set pcolor grass-color pxcor]
+ask patches with [pxcor = pitch-min-x or pxcor = pitch-max-x or pycor = pitch-min-y or pycor = pitch-max-y] [set pcolor 15]
+end
+to-report grass-color [x]
+ifelse ((x + 50) mod 10) < 5 [ report 52 ] ; dark green
+[ report 53 ] ; slightly lighter dark green
+end
+to draw-side-bands-diagonal
+; ---------- CONFIG ----------
+let wall-inset 10 ; distance from side walls
+let inner-gap 8 ; keep space from center line
+let band-thickness 3.0 ; line thickness for diagonal (in patches)
+; Middle horizontal band thickness
+let mid-height 4.5
+; X ranges for how far the bands extend toward center
+let left-x-min (pitch-min-x + wall-inset)
+let left-x-max (-1 - inner-gap)
+let right-x-min (1 + inner-gap)
+let right-x-max (pitch-max-x - wall-inset)
+; ---------- 1) MIDDLE BAND (horizontal) ----------
+ask patches with [pxcor >= left-x-min and pxcor <= left-x-max and abs pycor <= (mid-height / 2)] [set pcolor blue-band]
+ask patches with [pxcor >= right-x-min and pxcor <= right-x-max and abs pycor <= (mid-height / 2)] [set pcolor orange-band]
+end
+to-report blue-band report [5 32 79]  end
+to-report orange-band report [163 82 7] end
+to draw-center-markings
+ask patches with [pxcor = 0] [ set pcolor white ]
+let r 9
+ask patches with [abs (distancexy 0 0 - r) < 0.5] [set pcolor white]
+ask patch 0 0 [ set pcolor white ]
+end
+to draw-goals-and-nets
+let half-mouth floor (goal-mouth / 2)
+let net-depth 4 
+ask patches with [pxcor = pitch-min-x and abs pycor <= half-mouth] [set pcolor blue-goal]
+ask patches with [pxcor > pitch-min-x and pxcor <= pitch-min-x + net-depth and abs pycor <= half-mouth] [if ((pxcor + pycor) mod 2 = 0) [ set pcolor blue-net ] ]
+ask patches with [pxcor = pitch-max-x and abs pycor <= half-mouth] [set pcolor orange-goal]
+ask patches with [pxcor < pitch-max-x and pxcor >= pitch-max-x - net-depth and abs pycor <= half-mouth] [if ((pxcor + pycor) mod 2 = 0) [ set pcolor orange-net ] ]
+end
+to-report blue-goal report 104 ; darker blue
+end
+to-report orange-goal report 24 end
+to-report blue-net
+report 103 
+end
+to-report orange-net report 23 end
+to place-big-boostpads
+ask boostpads [ die ] ask boostcores [ die ]
+let coords [[-40 32] [39 32] [0 32] [39 -32] [0 -32] [-40 -32]]
+foreach coords [ c -> create-boostpads 1 [setxy item 0 c item 1 c set color red set shape "circle" set size 3.0 set cooldown 0 set boost-amount 100 ]
+create-boostcores 1 [ setxy item 0 c item 1 c set color 15 set shape "circle" set size 1.8 ] ]
+end
+to place-small-boostpads
+ask small-boostpads [ die ]
+let coords [[-25 30] [-25 15] [-25 0] [-25 -15] [-25 -30]
+[25 30] [25 15] [25 0] [25 -15] [25 -30]
+[-10 22] [-10 -22] [10 22] [10 -22]]
+foreach coords [ c -> create-small-boostpads 1 [ setxy item 0 c item 1 c set color red set shape "circle" set size 1.4 set cooldown 0 set boost-amount 12] ]
+end
+to create-ball
+ask balls [ die ]
+create-balls 1 [setxy 0 0 set shape "circle" set size 2.5 set color black set vx 0 set vy 0 ]
+end
+to go
+;; --- 1. CHRONOMÈTRE ET FIN DE MATCH ---
+if match-timer > 0 [set match-timer match-timer - 0.05]
+if match-timer <= 0 [set match-timer 0 display-final-results stop]
+;; --- 2. ACTIONS INDIVIDUELLES (MULTI-THREADING) ---
+;; On utilise ask-concurrent pour que les 4 voitures réfléchissent et
+;; bougent en même temps, évitant que le Player 1 ait toujours l'avantage.
+ask-concurrent cars [
+;; Friction (Rolling resistance)
+set speed speed * 0.98
+if speed < 0.01 [ set speed 0 ]
+;; IA + Mouvement + Check Mur (Tout ce qui est individuel)
+car-decide-and-act
+check-car-wall-collisions
+]
+;; --- 3. COLLISIONS INTER-AGENTS (SÉQUENTIEL) ---
+;; On traite les bumps APRÈS que tout le monde ait bougé pour une physique juste.
+handle-car-car-collisions
+handle-car-ball-collisions
+;; --- 4. GESTION DES BOOSTS ---
+ask boostpads [
+if cooldown > 0 [
+set cooldown cooldown - 1
+if cooldown = 0 [ set color red ]
+]
+]
+ask small-boostpads [
+if cooldown > 0 [
+set cooldown cooldown - 1
+if cooldown = 0 [ set color red ]
+]
+]
+;; --- 5. PHYSIQUE DE LA BALLE ET BUTS ---
+if start? [
+set start? false
+set goal-scored? false
+]
+play ;; Déplacement de la balle (friction/rebonds)
+;; On gère les collisions balle/voiture APRÈS le mouvement
+;; Utilise ici ta version "Multi-hit" pour éviter les balles fantômes
+
+if goal-scored? [
+update-score
+reset-after-goal
+]
+;; --- 6. SYSTÈME ANTI-BLOCAGE ET UI ---
+set ticks-since-last-touch ticks-since-last-touch + 1
+if ticks-since-last-touch > 200 [ unblock-game ]
+update-car-labels
+tick
+end
+to update-score
+;; On incrémente le score selon le côté où la balle est entrée
+if goal-side = "left" [ set orange-score orange-score + 1 ]
+if goal-side = "right" [ set blue-score blue-score + 1 ]
+;; Affichage dans la console pour le debug (utile pour ton rapport)
+print (word "BUT ! " scoreboard)
+end
+to reset-after-goal
+wait 1
+create-ball
+place-cars-2v2
+
+  assign-2v2-archetypes blue-arch-1 blue-arch-2 orange-arch-1 orange-arch-2
+;; --- RÉINITIALISATION CRITIQUE ---
+ask cars [
+set speed 0
+set boostInCar 33
+set chaser-mode "ball" ;; On force le mode ball pour redémarrer
+set target-boost nobody 
+    set bully-target nobody
+    set bully-timer 0;; On efface toute ancienne cible
+    set unblock-timer 0
+    set unblock-target-x 0
+    set unblock-target-y 0
+]
+set goal-scored? false
+set goal-side "none"
+end
+to play
+let friction 0.90 ; multiply speed each tick (lower = more slowing)
+let restitution 0.70 ; bounce energy retention (lower = “softer” bounces)
+let stop-eps 0.01 ; stop when speed is tiny
+ask balls [
+; ---- apply friction (slow down over time) ----
+set vx vx * friction
+set vy vy * friction
+; Si la balle est "quasiment" dans le mur, on lui donne une impulsion vers le centre
+;; --- LE "KICK" DE SÉCURITÉ (Balle à l'arrêt contre un mur) ---
+;; On vérifie si la vitesse est quasi nulle
+if (abs vx < stop-eps and abs vy < stop-eps) [
+;; 1. Mur Latéral (Gauche/Droite)
+if abs xcor > 47 [
+;; On donne une impulsion fixe de 3.0 vers l'intérieur
+set vx (ifelse-value (xcor > 0) [ -3.0 ] [ 3.0 ])
+set vy (random-float 2 - 1) ;; Petit angle aléatoire pour le réalisme
+print "SYSTEM: Balle à l'arrêt au mur latéral -> Projection !"
+]
+;; 2. Mur Haut/Bas
+if abs ycor > 37 [
+set vy (ifelse-value (ycor > 0) [ -3.0 ] [ 3.0 ])
+set vx (random-float 2 - 1)
+print "SYSTEM: Balle à l'arrêt au mur haut/bas -> Projection !"
+]
+]
+;; --- CALCUL DE LA NOUVELLE POSITION ---
+; stop completely if very slow (prevents endless micro-movement)
+if (abs vx < stop-eps and abs vy < stop-eps) [
+set vx 0
+set vy 0
+stop
+]
+; ---- predict next position ----
+let nx (xcor + vx)
+let ny (ycor + vy)
+let side goal-side-crossed nx ny
+if side != "none" [
+set goal-scored? true
+set goal-side side
+die
+stop
+]
+; ---- bounce on vertical walls (left/right) ----
+if (nx <= pitch-min-x or nx >= pitch-max-x) [
+set vx (- vx) * restitution
+; clamp inside so it doesn’t get stuck outside
+set nx max list (pitch-min-x + 0.1) (min list (pitch-max-x - 0.1) nx)
+]
+; ---- bounce on horizontal walls (top/bottom) ----
+if (ny <= pitch-min-y or ny >= pitch-max-y) [
+set vy (- vy) * restitution
+set ny max list (pitch-min-y + 0.1) (min list (pitch-max-y - 0.1) ny)
+]
+; ---- update position ----
+setxy nx ny
+]
+end
+to test-ball-physics
+ask balls [
+; give the ball a random kick
+set vx random-float 5 - 1
+set vy random-float 5 - 1
+]
+end
+to-report scoreboard
+report (word "BLUE " blue-score " | ORANGE " orange-score)
+end
+to-report goal-side-crossed [nx ny]
+let half-mouth goal-mouth / 2
+if (nx <= pitch-min-x and ny >= (- half-mouth) and ny <= half-mouth) [
+report "left"
+]
+if (nx >= pitch-max-x and ny >= (- half-mouth) and ny <= half-mouth) [
+report "right"
+]
+report "none"
+end
+;; cars procedures
+to place-cars-2v2
+ask cars [ die ]
+; ---- BLUE TEAM (LEFT) ----
+create-cars 2 [
+set team "blue"
+set color blue
+set shape "car"
+set size 2
+set boostInCar 33
+set speed 0
+set max-speed 1.2
+set accel 0.06
+set turn-rate 6
+set chaser-mode "ball"
+set target-boost nobody
+]
+; positions: one center, one slightly up
+let blue-list sort cars with [team = "blue"]
+ask item 0 blue-list [ setxy -30 0 ]
+ask item 1 blue-list [ setxy -35 12 ]
+; ---- ORANGE TEAM (RIGHT) ----
+create-cars 2 [
+set team "orange"
+set color orange
+set shape "car"
+set size 2
+set boostInCar 33
+set speed 0
+set max-speed 1.2
+set accel 0.06
+set turn-rate 6
+set chaser-mode "ball"
+set target-boost nobody
+]
+let orange-list sort cars with [team = "orange"]
+ask item 0 orange-list [ setxy 30 0 ]
+ask item 1 orange-list [ setxy 35 -12 ]
+; face the ball if it exists
+if any? balls [
+ask cars [ face one-of balls ]
+]
+end
+to label-cars
+; ---- BLUE TEAM ----
+let blue-cars sort cars with [team = "blue"]
+let i 1
+foreach blue-cars [
+c ->
+ask c [
+set label (word "Player " i)
+set label-color white
+]
+set i i + 1
+]
+; ---- ORANGE TEAM ----
+let orange-cars sort cars with [team = "orange"]
+set i 1
+foreach orange-cars [
+c ->
+ask c [
+set label (word "Player " i)
+set label-color white
+]
+set i i + 1
+]
+end
+to update-car-labels
+let blue-cars sort cars with [team = "blue"]
+let orange-cars sort cars with [team = "orange"]
+let i 1
+foreach blue-cars [
+c ->
+ask c [
+;; On utilise 'precision boostInCar 0' pour enlever les décimales
+set label (word "Player " i " (" precision boostInCar 0 ")")
+set label-color white
+]
+set i i + 1
+]
+set i 1
+foreach orange-cars [
+c ->
+ask c [
+set label (word "Player " i " (" precision boostInCar 0 ")")
+set label-color white
+]
+set i i + 1
+]
+end
+to handle-car-ball-collisions
+  let base-hit 0.9
+  let boost-hit 0.02
+  let restitution 0.85
+  let eps 0.1
+
+  ask balls [
+    ;; cache (sécurité/lecture)
+    let bx xcor
+    let by ycor
+    let br (size / 2)
+
+    let touching cars with [ distancexy bx by <= (br + (size / 2)) ]
+
+    if any? touching [
+      ;; kickoff contest uniquement si >= 2 contacts
+      let kick-off-contest? (ticks-since-last-touch < 5 and abs bx < 10 and count touching >= 2)
+
+      ;; perdant = le plus loin
+      let loser nobody
+      if kick-off-contest? [
+        set loser max-one-of touching [ distancexy bx by ]
+      ]
+
+      set ticks-since-last-touch 0
+
+      let total-dvx 0
+      let total-dvy 0
+      let total-ox  0
+      let total-oy  0
+      let hit-count count touching
+
+      foreach (sort touching) [ c ->
+        ;; --- géométrie voiture->balle ---
+        let cx [xcor] of c
+        let cy [ycor] of c
+        let cr ([size] of c / 2)
+
+        let dxx (bx - cx)
+        let dyy (by - cy)
+        let d (sqrt (dxx * dxx + dyy * dyy))
+        if d = 0 [ set d 0.0001 ]
+
+        let nx (dxx / d)
+        let ny (dyy / d)
+
+        ;; --- vitesse voiture (heading 0 = nord) ---
+        let cspeed [speed] of c
+        let chead  [heading] of c
+        let cboost [boostInCar] of c
+        let cteam  [team] of c
+
+        let cvx (cspeed * sin chead)
+        let cvy (cspeed * cos chead)
+
+        ;; vitesse relative balle vs voiture projetée sur la normale
+        let rvx (vx - cvx)
+        let rvy (vy - cvy)
+        let vrel (rvx * nx + rvy * ny)
+
+        ;; --- KICKOFF: seulement le perdant dévie la balle ---
+        if (kick-off-contest? and c = loser) [
+          let side-direction ifelse-value (cy >= 0) [ 1 ] [ -1 ]
+          let back-direction ifelse-value (cteam = "blue") [ -1 ] [ 1 ]
+
+          ;; impulsion anti-pinch
+          set total-dvx total-dvx + (back-direction * 1.5)
+          set total-dvy total-dvy + (side-direction * 2.5)
+
+          ;; push-out modéré (évite rester dans la hitbox)
+          set total-ox total-ox + (nx * 3)
+          set total-oy total-oy + (side-direction * 4)
+        ]
+        ;; --- collision standard pour tout le monde ---
+        if (not (kick-off-contest? and c = loser)) [
+          if (vrel < 0 or d < (br + cr)) [
+            let hit (base-hit + cspeed + (boost-hit * cboost))
+
+            set total-dvx total-dvx + ((- (1 + restitution) * vrel + hit) * nx)
+            set total-dvy total-dvy + ((- (1 + restitution) * vrel + hit) * ny)
+
+            let min-dist (br + cr)
+            let overlap (min-dist - d + eps)
+            if overlap > 0 [
+              set total-ox total-ox + (nx * overlap)
+              set total-oy total-oy + (ny * overlap)
+            ]
+          ]
+        ]
+      ]
+
+      ;; application “pinch”
+      set vx (vx + total-dvx)
+      set vy (vy + total-dvy)
+
+      ;; repositionnement moyen
+      set xcor (xcor + total-ox / hit-count)
+      set ycor (ycor + total-oy / hit-count)
+    ]
+  ]
+end
+
+to handle-car-car-collisions
+ask cars [
+;; IMPORTANT : On ajoute 'with [who > [who] of myself]' pour éviter le double calcul
+let partner one-of other cars in-radius (size * 0.9) with [who > [who] of myself]
+if partner != nobody [
+;; --- EFFET SUR L'ATTAQUANT (MOI) ---
+set heading (towards partner + 180)
+jump 0.5
+set speed speed * 0.5
+set unblock-timer 8 ;; On est un peu secoué par le choc
+;; --- EFFET SUR LA VICTIME (PARTNER) ---
+ask partner [
+set heading (towards myself + 180)
+jump 0.8 ;; On donne une impulsion un peu plus forte à la victime
+set speed speed * 0.3 ;; La victime perd plus de vitesse
+set unblock-timer 12 ;; "Stun" plus long : l'IA perd le contrôle
+]
+]
+]
+end
+;archetypes helper procedures
+to-report in-goal-mouth? [x y]
+let half (goal-mouth / 2)
+report (y >= (- half) and y <= half)
+end
+to car-decide-and-act
+;; --- 1. GESTION DU STUN (BUMP) ---
+;; Si on vient de se faire percuter, on "glisse" sans pouvoir tourner
+if unblock-timer > 0 [
+set unblock-timer unblock-timer - 1
+fd speed ;; On continue sur la lancée du choc
+check-car-wall-collisions
+stop ;; ON S'ARRÊTE LÀ : L'IA ne peut pas reprendre le volant
+]
+;; --- 1. CONSOMMATION DYNAMIQUE ---
+;; Plus on va vite, plus on consomme.
+;; Le coefficient 0.4 permet d'avoir une consommation équilibrée.
+if speed > 0.1 [
+let consumption (speed * 0.4)
+set boostInCar (boostInCar - consumption)
+]
+if boostInCar < 0 [ set boostInCar 0 ]
+if boostInCar > 100 [ set boostInCar 100 ]
+let effective-max-speed ifelse-value (boostInCar > 0) [ max-speed * 1.6 ] [ max-speed ]
+;; --- 2. COLLECTE DES GROS BOOSTS (Si rouge) ---
+let big-b one-of boostpads with [color = red] in-radius 4
+if big-b != nobody [
+set boostInCar 100
+ask big-b [
+set color grey ;; Devient gris (indisponible)
+set cooldown 100 ;; Temps avant réapparition
+]
+]
+;; --- 3. COLLECTE DES PETITS BOOSTS (+12 si rouge) ---
+let small-b one-of small-boostpads with [color = red] in-radius 2
+if small-b != nobody [
+set boostInCar (boostInCar + 12)
+ask small-b [
+set color grey ;; Devient gris
+set cooldown 30 ;; Les petits reviennent plus vite
+]
+]
+;; --- 2. LOGIQUE SPÉCIFIQUE À L'ARCHÉTYPE ---
+if archetype = "chaser" [
+decide-chaser
+]
+if archetype = "bully" [ decide-bully ]
+if archetype = "sentinel" [ decide-sentinel ]
+if archetype = "pro-rotator" [ decide-pro-rotator ]
+;; --- 3. ACTIONS COMMUNES (Après la décision) ---
+if speed < effective-max-speed [ set speed speed + accel ]
+;; Avancer et gérer les murs (valable pour tous)
+fd speed
+check-car-wall-collisions
+end
+to decide-chaser
+;; Logique de gestion de l'état (Ball vs Boost) spécifique au chaser
+ifelse boostInCar < 40 [
+if chaser-mode != "boost" [
+set chaser-mode "boost"
+set target-boost nobody
+]
+go-get-boost
+] [
+set chaser-mode "ball"
+go-chase-ball
+]
+end
+to go-chase-ball
+let target-ball one-of balls
+if target-ball != nobody [
+let ball-x [xcor] of target-ball
+let ball-y [ycor] of target-ball
+ifelse unblock-timer > 0 [
+;; --- MODE DÉBLOCAGE (Priorité Totale) ---
+set unblock-timer unblock-timer - 1
+face-smoothly-xy unblock-target-x unblock-target-y
+set speed 2.5
+] [
+;; --- NAVIGATION INTELLIGENTE ---
+let near-wall? (abs xcor > 38 or abs ycor > 30)
+let dist-ball distance target-ball
+;; Détection : Est-ce que je suis dans le camp adverse ?
+let i-am-in-opponent-half? ifelse-value (team = "blue") [ xcor > 1 ] [ xcor < -1 ]
+;; Détection : Est-ce que la balle est loin dans le camp adverse ?
+let ball-in-opponent-half? ifelse-value (team = "blue") [ ball-x > 1 ] [ ball-x < -1 ]
+;; CONDITION DE RESET :
+;; Si (je suis au mur ET la balle est loin) OU (je suis trop avancé et la balle est loin derrière le centre)
+ifelse (near-wall? ) or (i-am-in-opponent-half? and ball-in-opponent-half? = false )
+[
+;; On force le passage par le centre pour réinitialiser l'angle
+face-smoothly-xy 0 0
+]
+[
+;; --- LOGIQUE D'ATTAQUE NORMALE ---
+;; Empêcher de marquer contre son camp (se placer derrière la balle)
+ifelse (team = "blue" and xcor > ball-x) or (team = "orange" and xcor < ball-x)
+[
+let offset-x ifelse-value (team = "blue") [ -12 ] [ 12 ]
+face-smoothly-xy (ball-x + offset-x) ball-y
+]
+[
+face-smoothly-xy ball-x ball-y
+]
+]
+if speed < max-speed [ set speed speed + accel ]
+]
+]
+end
+to go-get-boost
+ifelse unblock-timer > 0 [
+;; --- MODE DÉBLOCAGE ---
+set unblock-timer unblock-timer - 1
+face-smoothly-xy unblock-target-x unblock-target-y
+set speed 2.5
+] [
+;; --- NAVIGATION NORMALE ---
+if target-boost = nobody or [color] of target-boost != red [
+let my-camp-boosts boostpads with [
+color = red and (ifelse-value ([team] of myself = "blue") [xcor < -10] [xcor > 10])
+]
+set target-boost one-of my-camp-boosts
+]
+if target-boost != nobody [
+let tx [xcor] of target-boost
+let ty [ycor] of target-boost
+let near-wall? (abs xcor > 40 and abs ycor > 30)
+;; NOUVEAU : On rentre au bercail depuis le camp adverse
+let returning-home? ifelse-value (team = "blue") [xcor > 0 and tx < 0] [xcor < 0 and tx > 0]
+ifelse (near-wall? and (distance target-boost > 40 or returning-home?)) [
+face-smoothly-xy 0 0 ;; On passe par le centre
+] [
+face-smoothly-xy tx ty
+]
+if speed < max-speed [ set speed speed + accel ]
+if distance target-boost < 2 [ set target-boost nobody ]
+]
+]
+end
+to decide-bully
+;; 1. LOGIQUE DE REPLI (Priorité)
+;; Si le boost est presque vide, on arrête de chasser les gens pour aller manger
+ifelse boostInCar < 10 [
+set chaser-mode "boost"
+set target-boost nobody
+go-get-boost
+] [
+;; 2. GESTION DU CIBLAGE (Timer & Random)
+;; Si on n'a pas de cible ou que le timer est fini, on change de proie
+if bully-target = nobody or bully-timer <= 0 [
+;; On sélectionne les voitures de l'équipe adverse
+let opponents other cars with [team != [team] of myself]
+if any? opponents [
+set bully-target one-of opponents
+set bully-timer 200;; Il harcèle la même personne pendant ~400 ticks
+]
+]
+;; 3. ATTAQUE (Si on a une cible)
+if bully-target != nobody [
+set bully-timer bully-timer - 1
+set chaser-mode "bully"
+go-bully-attack
+]
+]
+end
+to go-bully-attack
+let tx [xcor] of bully-target
+let ty [ycor] of bully-target
+;; --- NAVIGATION INTELLIGENTE ---
+;; Si la cible est dans l'autre moitié du terrain (x de signe opposé)
+;; on passe d'abord par la ligne médiane (x = 0)
+let target-in-opposite-half? (xcor * tx < 0)
+ifelse target-in-opposite-half? [
+;; Waypoint au milieu pour intercepter la rotation
+face-smoothly-xy 0 ty
+] [
+;; On fonce sur la proie
+face-smoothly-xy tx ty
+]
+;; --- VITESSE DE POINTE (LE BUMP) ---
+let current-limit max-speed
+if boostInCar > 40 [
+set current-limit max-speed * 2.0 ;; On monte à 200% de vitesse
+set boostInCar boostInCar - 0.5 ;; Consommation "Turbo"
+]
+;; Accélération agressive (Vitesse non-dictatoriale)
+if speed < current-limit [
+set speed speed + (accel * 3)
+]
+end
+to decide-sentinel
+  let target-ball one-of balls
+  if target-ball = nobody [ stop ]
+
+  ;; --- PRIORITÉ 1 : DÉBLOCAGE OU STUN (Anti-bug / Bump) ---
+  ifelse unblock-timer > 0 [
+    set unblock-timer unblock-timer - 1
+    face-smoothly-xy unblock-target-x unblock-target-y
+    set speed 2.5
+  ] [
+    ;; --- PRIORITÉ 2 : RETOUR AU MILIEU (Si trop avancé) ---
+    let overextended? ifelse-value (team = "blue") [ xcor > 5 ] [ xcor < -5 ]
+
+    ifelse overextended? [
+      ;; On vise le centre (0,0) pour se repositionner proprement
+      face-smoothly-xy 0 0
+      if speed < max-speed [ set speed speed + accel ]
+    ] [
+      ;; --- PRIORITÉ 3 : REPLI BOOST (Seulement si on est dans notre camp) ---
+      ifelse boostInCar < 10 [
+        set chaser-mode "boost"
+        go-get-boost
+      ] [
+        ;; --- PRIORITÉ 4 : LOGIQUE DE SENTINELLE NORMALE ---
+        let ball-x [xcor] of target-ball
+        let ball-y [ycor] of target-ball
+        let dist-to-ball distance target-ball
+
+        ;; La balle est-elle menaçante ?
+        let ball-dangerous? ifelse-value (team = "blue")
+          [ ball-x < 0 and dist-to-ball < 25 ]
+          [ ball-x > 0 and dist-to-ball < 25 ]
+
+        ifelse ball-dangerous? [
+          set chaser-mode "chase"
+          go-chase-ball 
+          ;; Bonus de vitesse pour le dégagement
+          if speed < (max-speed * 1.2) [ set speed speed + accel ]
+        ] [
+          ;; Position de "Shadowing" en attendant l'action
+          set chaser-mode "shadow"
+          go-sentinel-position ball-x ball-y
+        ]
+      ]
+    ]
+  ]
+end 
+to go-sentinel-position [bx by]
+;; On définit le centre de notre propre but
+let my-goal-x ifelse-value (team = "blue") [ pitch-min-x ] [ pitch-max-x ]
+let my-goal-y 0
+;; On calcule un point "Shadow" à 30% de la distance entre le but et la balle
+let target-x my-goal-x + (bx - my-goal-x) * 0.3
+let target-y my-goal-y + (by - my-goal-y) * 0.3
+ifelse speed < 0.5 [
+set speed (speed + accel) ;; On accélère doucement vers 0.5
+] [
+if speed > 0.5 [
+set speed (speed - accel) ;; On freine doucement si on va trop vite
+]
+]
+;; Navigation avec Waypoint pour ne pas rester collé au mur du fond
+let near-wall? (abs xcor > 37 or abs ycor > 30)
+ifelse near-wall? [
+face-smoothly-xy 0 0
+] [
+face-smoothly-xy target-x target-y
+]
+;; Vitesse modérée pour rester en position
+;if speed < max-speed [ set speed speed + accel ]
+end
+to decide-pro-rotator
+let target-ball one-of balls
+if target-ball = nobody [ stop ]
+let ball-x [xcor] of target-ball
+;; On appelle le reporter et on stocke le résultat dans 'first?'
+let first? am-i-first?
+ ;; On vérifie xcor, vx et vy de la balle directement
+  
+;; 1. ANALYSE DE LA ZONE (Marge de 0.5 pour la stabilité)
+let ball-in-my-half? ifelse-value (team = "blue") [ball-x < -0.5] [ball-x > 0.5]
+;; 2. RÉGLE BOOST (Conditionnelle)
+if boostInCar < 30 and (distance target-ball) > 20 and not first? [
+go-get-boost
+stop
+]
+;; 3. LOGIQUE DE ROTATION
+ifelse ball-in-my-half? [
+;; DÉFENSE : Le 1st man challenge, le 2nd man cover
+ifelse first? [
+go-chase-ball
+] [
+go-sentinel-position ball-x [ycor] of target-ball
+]
+] [
+;; ATTAQUE / KICK-OFF : Le 1st man striker, le 2nd man support
+ifelse first? [
+go-chase-ball
+] [
+go-pro-support
+]
+]
+end
+to-report am-i-first?
+let target-ball one-of balls
+let dist-me distance target-ball
+let mate one-of other cars with [team = [team] of myself]
+if mate = nobody [ report true ]
+let dist-mate [distance target-ball] of mate
+  ;; --- NOUVEAU : Détection du mate sur le mur ---
+  let mate-on-wall? [abs xcor > 38 or abs ycor > 32] of mate
+
+  ;; Si le mate est sur le mur, je suis automatiquement "first" car mieux placé au sol
+  if mate-on-wall? [ report true ]
+;; --- TIE-BREAKER POUR LE KICK-OFF ---
+;; Si les distances sont quasi identiques (différence < 0.3)
+if abs (dist-me - dist-mate) < 0.3 [
+report who < [who] of mate ;; Le plus petit ID y va, l'autre reste
+]
+report dist-me < dist-mate
+end
+to go-pro-support
+let target-x ifelse-value (team = "blue") [ -5 ] [ 5 ] ;; Un peu en retrait du centre
+face-smoothly-xy target-x 0
+;; Vitesse non-dictatoriale vers 0.3
+ifelse speed < 0.3 [ set speed speed + accel ] [ if speed > 0.3 [ set speed speed - accel ] ]
+end
+;; --- FONCTIONS UTILITAIRES ---
+to face-smoothly-xy [tx ty]
+;; Calcule l'angle vers les coordonnées cibles
+let target-heading towardsxy tx ty
+let diff subtract-headings target-heading heading
+;; Virage progressif selon le turn-rate défini dans setup
+ifelse abs diff > turn-rate [
+set heading heading + (ifelse-value (diff > 0) [ turn-rate ] [ 0 - turn-rate ])
+] [
+set heading target-heading
+]
+end
+to assign-2v2-archetypes [ blue-a1 blue-a2 orange-a1 orange-a2 ]
+  ;; On récupère les listes triées pour être sûr de qui est qui
+  let blue-team sort cars with [ team = "blue" ]
+  let orange-team sort cars with [ team = "orange" ]
+
+  ;; On assigne les choix de l'interface aux agents
+  ask item 0 blue-team   [ set archetype blue-a1 ]
+  ask item 1 blue-team   [ set archetype blue-a2 ]
+  ask item 0 orange-team [ set archetype orange-a1 ]
+  ask item 1 orange-team [ set archetype orange-a2 ]
+end
+to check-car-wall-collisions
+if speed <= 0 [ stop ] ;;
+let margin 2.0 ;; On augmente un peu la marge pour les collisions à haute vitesse
+;; --- COLLISION MURS LATÉRAUX (Gauche/Droite) ---
+if xcor > (pitch-max-x - margin) or xcor < (pitch-min-x + margin) [
+;; On inverse la direction horizontale (360 - angle)
+set heading (360 - heading)
+;; On replace la voiture dans le terrain pour éviter qu'elle ne s'enfonce
+set xcor ifelse-value (xcor > 0) [pitch-max-x - margin] [pitch-min-x + margin]
+;; On réduit drastiquement la vitesse (choc)
+set speed speed * 0.7
+]
+;; --- COLLISION MURS HAUT/BAS ---
+if ycor > (pitch-max-y - margin) or ycor < (pitch-min-y + margin) [
+;; On inverse la direction verticale (180 - angle)
+set heading (180 - heading)
+;; On replace la voiture dans le terrain
+set ycor ifelse-value (ycor > 0) [pitch-max-y - margin] [pitch-min-y + margin]
+set speed speed * 0.7
+]
+end
+to unblock-game
+let target-ball one-of balls
+;; On cible la voiture la plus proche de la balle, qu'elle soit en mode ball ou boost
+let victim one-of cars 
+if victim != nobody [
+ask victim [
+set unblock-timer 60 ;; Priorité pendant 60 ticks
+;; --- LOGIQUE DE CIBLE DE SECOURS ---
+let near-wall? (abs xcor > 40 or abs ycor > 30)
+ifelse near-wall? [
+;; Si on est coincé au mur, la priorité c'est de revenir au centre
+set unblock-target-x 0
+set unblock-target-y 0
+] [
+;; Sinon, on fonce directement sur la balle pour débloquer
+set unblock-target-x [xcor] of target-ball
+set unblock-target-y [ycor] of target-ball
+]
+print (word "SYSTEM: Déblocage discret pour " label)
+]
+]
+set ticks-since-last-touch 0
+end
+to display-final-results
+print "============================"
+print " FIN DU MATCH !"
+print "============================"
+print (word "SCORE FINAL : " scoreboard)
+let winner-team "none"
+;; Détermination du vainqueur
+ifelse blue-score > orange-score [
+print "VICTOIRE DE L'ÉQUIPE BLEUE !"
+set winner-team "blue"
+] [
+ifelse orange-score > blue-score [
+print "VICTOIRE DE L'ÉQUIPE ORANGE !"
+set winner-team "orange"
+] [
+print "MATCH NUL !"
+]
+]
+;; Affichage des archétypes gagnants
+if winner-team != "none" [
+    ;; 1. On donne +1 à chaque archétype de l'équipe gagnante
+    ask cars with [ team = winner-team ] [
+      if archetype = "chaser"      [ set score-chaser score-chaser + 1 ]
+      if archetype = "sentinel"    [ set score-sentinel score-sentinel + 1 ]
+      if archetype = "bully"       [ set score-bully score-bully + 1 ]
+      if archetype = "pro-rotator" [ set score-pro-rotator score-pro-rotator + 1 ]]
+    ;; 2. On retire 1 à chaque archétype de l'équipe perdante
+    ask cars with [ team != winner-team ] [
+      if archetype = "chaser"      [ set score-chaser score-chaser - 1 ]
+      if archetype = "sentinel"    [ set score-sentinel score-sentinel - 1 ]
+      if archetype = "bully"       [ set score-bully score-bully - 1 ]
+      if archetype = "pro-rotator" [ set score-pro-rotator score-pro-rotator - 1 ]
+    ]
+    update-plots
+;; On récupère la liste des archétypes des voitures de l'équipe gagnante
+let winners-archetypes [archetype] of cars with [team = winner-team]
+print (word "Composition gagnante : " winners-archetypes)
+]
+  print (word "Power Ranking -> Chaser: " score-chaser " | Sentinel: " score-sentinel " | Bully: " score-bully " | Pro: " score-pro-rotator)
+print "============================"
+end
+to-report blue-win
+if blue-score > orange-score [ report 1 ]
+report 0
+end
+
+to-report orange-win
+if orange-score > blue-score [ report 1 ]
+report 0
+end
+
+to-report draw
+if blue-score = orange-score [ report 1 ]
+report 0
+end]]></code>
+  <widgets>
+    <view x="390" wrappingAllowedX="true" y="10" frameRate="30.0" minPycor="-40" height="500" showTickCounter="true" patchSize="6.2" fontSize="10" wrappingAllowedY="true" width="624" tickCounterLabel="ticks" maxPycor="39" updateMode="0" maxPxcor="49" minPxcor="-50"></view>
+    <chooser x="95" y="190" height="60" variable="blue-arch-1" current="3" display="blue-arch-1" width="250" sizeVersion="0">
+      <choice type="string" value="chaser"></choice>
+      <choice type="string" value="sentinel"></choice>
+      <choice type="string" value="bully"></choice>
+      <choice type="string" value="pro-rotator"></choice>
+    </chooser>
+    <chooser x="95" y="260" height="60" variable="blue-arch-2" current="1" display="blue-arch-2" width="250" sizeVersion="0">
+      <choice type="string" value="chaser"></choice>
+      <choice type="string" value="sentinel"></choice>
+      <choice type="string" value="bully"></choice>
+      <choice type="string" value="pro-rotator"></choice>
+    </chooser>
+    <chooser x="95" y="325" height="60" variable="orange-arch-1" current="2" display="orange-arch-1" width="250" sizeVersion="0">
+      <choice type="string" value="chaser"></choice>
+      <choice type="string" value="sentinel"></choice>
+      <choice type="string" value="bully"></choice>
+      <choice type="string" value="pro-rotator"></choice>
+    </chooser>
+    <chooser x="95" y="395" height="60" variable="orange-arch-2" current="0" display="orange-arch-2" width="250" sizeVersion="0">
+      <choice type="string" value="chaser"></choice>
+      <choice type="string" value="sentinel"></choice>
+      <choice type="string" value="bully"></choice>
+      <choice type="string" value="pro-rotator"></choice>
+    </chooser>
+    <monitor x="1015" precision="1" y="15" height="60" fontSize="11" width="100" display="Time left">precision match-timer 1</monitor>
+    <button x="40" y="25" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="75" display="setup">setup</button>
+    <button x="40" y="70" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="95" display="Go">go</button>
+    <button x="40" y="115" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="96" display="Magic hand">test-ball-physics</button>
+    <monitor x="1115" precision="17" y="15" height="60" fontSize="11" width="145" display="score">scoreboard</monitor>
+    <monitor x="1015" precision="17" y="80" height="60" fontSize="13" width="100" display="P1 Blue">[archetype] of item 0 (sort cars with [team = "blue"])</monitor>
+    <monitor x="1115" precision="17" y="80" height="60" fontSize="13" width="100" display="P2 Blue">[archetype] of item 1 (sort cars with [team = "blue"])</monitor>
+    <monitor x="1285" precision="17" y="80" height="60" fontSize="13" width="100" display="P1 Orange">[archetype] of item 0 (sort cars with [team = "orange"])</monitor>
+    <monitor x="1390" precision="17" y="80" height="60" fontSize="13" width="100" display="P2 Orange">[archetype] of item 1 (sort cars with [team = "orange"])</monitor>
+    <plot x="1015" autoPlotX="true" yMax="10.0" autoPlotY="true" yAxis="Points" y="160" xMin="0.0" height="290" legend="false" xMax="10.0" yMin="0.0" width="480" xAxis="Archetypes" display="Archetype Performance">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Chaser " color="-4117725" legend="true">
+        <setup></setup>
+        <update>plot score-chaser</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Sentinel" color="-13791810" legend="true">
+        <setup></setup>
+        <update>plot score-sentinel</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Bully" color="-16383231" legend="true">
+        <setup></setup>
+        <update>plot score-bully</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Rotator" color="-14105802" legend="true">
+        <setup></setup>
+        <update>plot score-pro-rotator</update>
+      </pen>
+    </plot>
+  </widgets>
+  <info>## WHAT IS IT?
+
+(a general understanding of what the model is trying to show or explain)
+
+## HOW IT WORKS
+
+(what rules the agents use to create the overall behavior of the model)
+
+## HOW TO USE IT
+
+(how to use the model, including a description of each of the items in the Interface tab)
+
+## THINGS TO NOTICE
+
+(suggested things for the user to notice while running the model)
+
+## THINGS TO TRY
+
+(suggested things for the user to try to do (move sliders, switches, etc.) with the model)
+
+## EXTENDING THE MODEL
+
+(suggested things to add or change in the Code tab to make the model more complicated, detailed, accurate, etc.)
+
+## NETLOGO FEATURES
+
+(interesting or unusual features of NetLogo that the model uses, particularly in the Code tab; or where workarounds were needed for missing features)
+
+## RELATED MODELS
+
+(models in the NetLogo Models Library and elsewhere which are of related interest)
+
+## CREDITS AND REFERENCES
+
+(a reference to the model's URL on the web if it has one, as well as any other necessary credits, citations, and links)
+</info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="CCvsPRPR" repetitions="20" sequentialRunOrder="false" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[match-timer <= 0]]></exitCondition>
+      <metrics>
+        <metric>blue-win</metric>
+        <metric>orange-win</metric>
+        <metric>draw</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="blue-arch-1">
+          <value value="&quot;chaser&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="blue-arch-2">
+          <value value="&quot;chaser&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="orange-arch-1">
+          <value value="&quot;pro-rotator&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="orange-arch-2">
+          <value value="&quot;pro-rotator&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="CCvsPRS" repetitions="20" sequentialRunOrder="false" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[match-timer <= 0]]></exitCondition>
+      <metrics>
+        <metric>blue-win</metric>
+        <metric>orange-win</metric>
+        <metric>draw</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="blue-arch-1">
+          <value value="&quot;chaser&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="blue-arch-2">
+          <value value="&quot;chaser&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="orange-arch-1">
+          <value value="&quot;pro-rotator&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="orange-arch-2">
+          <value value="&quot;sentinel&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="CCvsPRB" repetitions="20" sequentialRunOrder="false" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[match-timer <= 0]]></exitCondition>
+      <metrics>
+        <metric>blue-win</metric>
+        <metric>orange-win</metric>
+        <metric>draw</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="blue-arch-1">
+          <value value="&quot;chaser&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="blue-arch-2">
+          <value value="&quot;chaser&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="orange-arch-1">
+          <value value="&quot;pro-rotator&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="orange-arch-2">
+          <value value="&quot;bully&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="CPRvsSB" repetitions="20" sequentialRunOrder="false" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[match-timer <= 0]]></exitCondition>
+      <metrics>
+        <metric>blue-win</metric>
+        <metric>orange-win</metric>
+        <metric>draw</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="blue-arch-1">
+          <value value="&quot;chaser&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="blue-arch-2">
+          <value value="&quot;pro-rotator&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="orange-arch-1">
+          <value value="&quot;sentinel&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="orange-arch-2">
+          <value value="&quot;bully&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="CCvsCC" repetitions="20" sequentialRunOrder="false" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[match-timer <= 0]]></exitCondition>
+      <metrics>
+        <metric>blue-win</metric>
+        <metric>orange-win</metric>
+        <metric>draw</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="blue-arch-1">
+          <value value="&quot;chaser&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="blue-arch-2">
+          <value value="&quot;chaser&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="orange-arch-1">
+          <value value="&quot;chaser&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="orange-arch-2">
+          <value value="&quot;chaser&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="PRPRvsPRPR" repetitions="20" sequentialRunOrder="false" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[match-timer <= 0]]></exitCondition>
+      <metrics>
+        <metric>blue-win</metric>
+        <metric>orange-win</metric>
+        <metric>draw</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="blue-arch-1">
+          <value value="&quot;pro-rotator&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="blue-arch-2">
+          <value value="&quot;pro-rotator&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="orange-arch-1">
+          <value value="&quot;pro-rotator&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="orange-arch-2">
+          <value value="&quot;pro-rotator&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="CBvsPRS" repetitions="20" sequentialRunOrder="false" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[match-timer <= 0]]></exitCondition>
+      <metrics>
+        <metric>blue-win</metric>
+        <metric>orange-win</metric>
+        <metric>draw</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="blue-arch-1">
+          <value value="&quot;chaser&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="blue-arch-2">
+          <value value="&quot;bully&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="orange-arch-1">
+          <value value="&quot;pro-rotator&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="orange-arch-2">
+          <value value="&quot;sentinel&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="CSvsPRB" repetitions="20" sequentialRunOrder="false" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[match-timer <= 0]]></exitCondition>
+      <metrics>
+        <metric>blue-win</metric>
+        <metric>orange-win</metric>
+        <metric>draw</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="blue-arch-1">
+          <value value="&quot;chaser&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="blue-arch-2">
+          <value value="&quot;sentinel&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="orange-arch-1">
+          <value value="&quot;pro-rotator&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="orange-arch-2">
+          <value value="&quot;bully&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+  </experiments>
+</model>
